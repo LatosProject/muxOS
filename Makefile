@@ -18,11 +18,20 @@ gdt.o: gdt.c gdt.h
 idt.o: idt.c idt.h isr.c
 	gcc -m32 -ffreestanding -fno-builtin -c idt.c -o idt.o
 
-isr.o: isr.c 
+isr.o: isr.c
 	gcc -m32 -ffreestanding -fno-builtin -c isr.c -o isr.o
 
-$(TARGET): boot.o kernel.o vga.o gdt.o idt.o isr.o linker.ld
-	gcc -m32 -T linker.ld -o $(TARGET) -ffreestanding -nostdlib boot.o kernel.o vga.o gdt.o idt.o
+pic.o: pic.c pic.h io.h
+	gcc -m32 -ffreestanding -fno-builtin -c pic.c -o pic.o
+
+keyboard.o: keyboard.c keyboard.h pic.h io.h vga.h
+	gcc -m32 -ffreestanding -fno-builtin -mgeneral-regs-only -c keyboard.c -o keyboard.o
+
+console.o: console.c console.h vga.h
+	gcc -m32 -ffreestanding -fno-builtin -c console.c -o console.o
+
+$(TARGET): boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o linker.ld
+	gcc -m32 -T linker.ld -o $(TARGET) -ffreestanding -nostdlib boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o
 
 $(ISO): $(TARGET)
 	mkdir -p iso/boot/grub
