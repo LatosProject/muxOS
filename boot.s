@@ -14,6 +14,8 @@ _start:
     mov esp, stack_top
 
     ; Go to kernel
+    push ebx        ; multiboot info*
+    push eax        ; 
     call kernel_main
 
 .hang:

@@ -20,4 +20,6 @@ SECTIONS {
         *(COMMON)
         *(.bss)
     }
+
+    _kernel_end = .;
 }

@@ -2,31 +2,49 @@
 
 #include "vga.h"
 #include "io.h" // 需要 outb
+#include "serial.h"
 static void update_hw_cursor();
 static int cursor_x = 0;
 static int cursor_y = 0;
 static char *vga = (char *)0xb8000;
 static void scroll();
+
+void vga_backspace() {
+  if (cursor_x > 0) {
+    cursor_x--;
+  } else if (cursor_y > 0) {
+    cursor_y--;
+    cursor_x = 79;
+  } else {
+    return;
+  }
+  int offset = (cursor_y * 80 + cursor_x) * 2;
+  vga[offset] = ' ';
+  vga[offset + 1] = 0x07;
+  update_hw_cursor();
+}
 void print(const char *str, unsigned char color) {
   if (color == 0)
     color = 0x07;
   for (int i = 0; str[i]; i++) {
+    // serial_putchar(str[i]); // 同步输出到串口
     if (str[i] == '\n') {
       cursor_y++;
       cursor_x = 0;
+      if (cursor_y >= 25)
+        scroll();
       continue;
     }
     int offset = (cursor_y * 80 + cursor_x) * 2;
     vga[offset] = str[i];
     vga[offset + 1] = color ? color : 0x07;
     cursor_x++;
-  }
-  if (cursor_x >= 80) {
-    cursor_y++;
-    cursor_x = 0;
-  }
-  if (cursor_y >= 25) {
-    scroll();
+    if (cursor_x >= 80) {
+      cursor_y++;
+      cursor_x = 0;
+      if (cursor_y >= 25)
+        scroll();
+    }
   }
   update_hw_cursor();
 }
@@ -44,6 +62,7 @@ static void scroll() {
       int dst = (y * 80 + x) * 2;
       int src = ((y + 1) * 80 + x) * 2;
       vga[dst] = vga[src];
+      vga[dst + 1] = vga[src + 1];
     }
   }
   for (int x = 0; x < 80; x++) {
@@ -76,4 +95,14 @@ void clear_screen() {
   }
   cursor_x = 0;
   cursor_y = 0;
+}
+
+void print_hex(uint32_t val) {
+  char buf[11] = "0x00000000";
+  for (int i = 9; i >= 2; i--) {
+    int nibble = val & 0xF;
+    buf[i] = nibble < 10 ? '0' + nibble : 'a' + nibble - 10;
+    val >>= 4;
+  }
+  print(buf, 0x07);
 }

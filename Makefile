@@ -30,8 +30,18 @@ keyboard.o: keyboard.c keyboard.h pic.h io.h vga.h
 console.o: console.c console.h vga.h
 	gcc -m32 -ffreestanding -fno-builtin -c console.c -o console.o
 
-$(TARGET): boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o linker.ld
-	gcc -m32 -T linker.ld -o $(TARGET) -ffreestanding -nostdlib boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o
+pmm.o: pmm.c pmm.h
+	gcc -m32 -ffreestanding -fno-builtin -c pmm.c -o pmm.o
+
+vmm.o: vmm.c vmm.h pmm.h
+	gcc -m32 -ffreestanding -fno-builtin -c vmm.c -o vmm.o
+
+serial.o: serial.c serial.h io.h
+	gcc -m32 -ffreestanding -fno-builtin -c serial.c -o serial.o
+
+
+$(TARGET): boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o pmm.o vmm.o serial.o linker.ld
+	gcc -m32 -T linker.ld -o $(TARGET) -ffreestanding -nostdlib boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o pmm.o vmm.o serial.o
 
 $(ISO): $(TARGET)
 	mkdir -p iso/boot/grub
@@ -40,8 +50,7 @@ $(ISO): $(TARGET)
 	grub-mkrescue -o $(ISO) iso
 
 run: $(ISO)
-	qemu-system-i386 -cdrom $(ISO)
-
+	qemu-system-i386 -cdrom $(ISO) -display gtk
 clean:
 	rm -f *.o $(TARGET) $(ISO)
 	rm -rf iso

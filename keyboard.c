@@ -26,18 +26,42 @@ static const char scancode_map[128] = {
     /*39*/ ' ',
 };
 
+static const char shift_map[128] = {
+    /*00*/ 0,
+    /*01*/ 0, // ESC
+    /*02*/ '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+',
+    /*0E*/ '\b',
+    /*0F*/ '\t',
+    /*10*/ 'Q',  'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{',  '}',
+    /*1C*/ '\n',
+    /*1D*/ 0, // left ctrl
+    /*1E*/ 'A',  'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"',  '~',
+    /*2A*/ 0, // left shift
+    /*2B*/ '|',
+    /*2C*/ 'Z',  'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?',
+    /*36*/ 0, // right shift
+    /*37*/ '*',
+    /*38*/ 0, // left alt
+    /*39*/ ' ',
+};
+
+static volatile int shift = 0;
+
 __attribute__((interrupt)) void
 keyboard_handler(struct interrupt_frame *frame) {
   uint8_t scancode = inb(0x60);
-  if (!(scancode & 0x80)) { // bit7=1
-    char c = (scancode < 128) ? scancode_map[scancode] : 0;
-    if (c) {
-      char buf[2] = {c, 0};
-      print(buf, 0);
-      kb_buf_push(c);
-    }
+  if (scancode & 0x80) {
+    // key release: check if shift released
+    uint8_t sc = scancode & 0x7F;
+    if (sc == 0x2A || sc == 0x36) shift = 0;
+  } else {
+    // key press
+    if (scancode == 0x2A || scancode == 0x36) { shift = 1; pic_eoi(1); return; }
+    const char *map = shift ? shift_map : scancode_map;
+    char c = (scancode < 128) ? map[scancode] : 0;
+    if (c) kb_buf_push(c);
   }
-  pic_eoi(1); // end
+  pic_eoi(1);
 }
 
 void keyboard_init(void) {
