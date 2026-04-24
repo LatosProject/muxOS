@@ -11,6 +11,6 @@ struct interrupt_frame {
 
 __attribute__((interrupt))
 void keyboard_handler(struct interrupt_frame *frame);
-
+void kb_buf_push(char c) ;
 void keyboard_init(void);
 char kb_getchar();

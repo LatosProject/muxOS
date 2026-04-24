@@ -1,9 +1,12 @@
 #include "idt.h"
-#include "vga.h"
 #include "keyboard.h"
+#include "vga.h"
+#include <stdint.h>
 extern void isr0();
 extern void isr6();
 extern void isr13();
+extern void irq0_stub();
+extern void syscall_stub();
 static idt_entry_t idt[IDT_SIZE];
 static idt_ptr_t idtp;
 
@@ -26,6 +29,8 @@ void idt_init() {
   idt_set(6, (uint32_t)(unsigned long)isr6, 0x08, 0x8E);
   idt_set(13, (uint32_t)(unsigned long)isr13, 0x08, 0x8E);
   idt_set(0x21, (uint32_t)(unsigned long)keyboard_handler, 0x08, 0x8E);
+  idt_set(32, (uint32_t)(unsigned long)irq0_stub, 0x08, 0x8E);
+  idt_set(0x80, (uint32_t)(unsigned long)syscall_stub, 0x08, 0xEE);
   asm volatile("lidt %0" : : "m"(idtp));
   asm volatile("sti");
 

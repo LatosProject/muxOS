@@ -6,6 +6,9 @@ all: $(ISO)
 boot.o: boot.s
 	nasm -f elf32 boot.s -o boot.o
 
+switch.o: switch.s
+	nasm -f elf32 switch.s -o switch.o
+
 kernel.o: kernel.c vga.h
 	gcc -m32 -ffreestanding -fno-builtin -c kernel.c -o kernel.o
 
@@ -39,9 +42,14 @@ vmm.o: vmm.c vmm.h pmm.h
 serial.o: serial.c serial.h io.h
 	gcc -m32 -ffreestanding -fno-builtin -c serial.c -o serial.o
 
+process.o: process.c process.h 
+	gcc -m32 -ffreestanding -fno-builtin -c process.c -o process.o
 
-$(TARGET): boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o pmm.o vmm.o serial.o linker.ld
-	gcc -m32 -T linker.ld -o $(TARGET) -ffreestanding -nostdlib boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o pmm.o vmm.o serial.o
+syscall.o: syscall.c syscall.h
+	gcc -m32 -ffreestanding -fno-builtin -c syscall.c -o syscall.o
+
+$(TARGET): boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o pmm.o vmm.o serial.o process.o switch.o syscall.o linker.ld
+	gcc -m32 -T linker.ld -o $(TARGET) -ffreestanding -nostdlib boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o pmm.o vmm.o serial.o process.o switch.o syscall.o
 
 $(ISO): $(TARGET)
 	mkdir -p iso/boot/grub

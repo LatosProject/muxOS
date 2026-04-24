@@ -1,5 +1,5 @@
+#include "io.h"
 #include "kernel.h"
-
 void isr0() {
   PANIC("INFO: Divide by zero");
   for (;;)
