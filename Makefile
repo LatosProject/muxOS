@@ -9,6 +9,30 @@ boot.o: boot.s
 switch.o: switch.s
 	nasm -f elf32 switch.s -o switch.o
 
+user_entry.o: user_entry.s
+	nasm -f elf32 user_entry.s -o user_entry.o
+
+user_prog.o: user_prog.s
+	nasm -f elf32 user_prog.s -o user_prog.o
+
+user_task.o: user_task.c
+	gcc -m32 -ffreestanding -fno-builtin -fno-pic -c user_task.c -o user_task.o
+
+user_start.o: user_start.s
+	nasm -f elf32 user_start.s -o user_start.o
+
+user_simple.o: user_simple.s
+	nasm -f elf32 user_simple.s -o user_simple.o
+
+user_prog_c.o: user_prog_c.s
+	nasm -f elf32 user_prog_c.s -o user_prog_c.o
+
+userlib.o: userlib.c
+	gcc -m32 -ffreestanding -fno-builtin -fno-pic -O0 -c userlib.c -o userlib.o
+
+user_crt.o: user_crt.s
+	nasm -f elf32 user_crt.s -o user_crt.o
+
 kernel.o: kernel.c vga.h
 	gcc -m32 -ffreestanding -fno-builtin -c kernel.c -o kernel.o
 
@@ -48,17 +72,20 @@ process.o: process.c process.h
 syscall.o: syscall.c syscall.h
 	gcc -m32 -ffreestanding -fno-builtin -c syscall.c -o syscall.o
 
-$(TARGET): boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o pmm.o vmm.o serial.o process.o switch.o syscall.o linker.ld
-	gcc -m32 -T linker.ld -o $(TARGET) -ffreestanding -nostdlib boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o pmm.o vmm.o serial.o process.o switch.o syscall.o
+tss.o: tss.c tss.h gdt.h
+	gcc -m32 -ffreestanding -fno-builtin -c tss.c -o tss.o
+
+$(TARGET): boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o pmm.o vmm.o serial.o process.o switch.o syscall.o tss.o user_entry.o user_crt.o userlib.o linker.ld
+	gcc -m32 -T linker.ld -o $(TARGET) -ffreestanding -nostdlib boot.o kernel.o vga.o gdt.o idt.o isr.o pic.o keyboard.o console.o pmm.o vmm.o serial.o process.o switch.o syscall.o tss.o user_entry.o user_crt.o userlib.o
 
 $(ISO): $(TARGET)
 	mkdir -p iso/boot/grub
 	cp $(TARGET) iso/boot/
-	echo 'menuentry "MuxOS" { multiboot /boot/$(TARGET) }' > iso/boot/grub/grub.cfg
+	printf 'set timeout=1\nset default=0\nmenuentry "MuxOS" { multiboot /boot/$(TARGET) }\n' > iso/boot/grub/grub.cfg
 	grub-mkrescue -o $(ISO) iso
 
 run: $(ISO)
-	qemu-system-i386 -cdrom $(ISO) -display gtk
+	qemu-system-i386 -cdrom $(ISO) -serial stdio -display gtk
 clean:
 	rm -f *.o $(TARGET) $(ISO)
 	rm -rf iso

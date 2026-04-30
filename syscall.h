@@ -6,23 +6,14 @@
 #define STDOUT 1
 #define STDERR 2
 
-#define SYS_READ  0
+#define SYS_READ   0
 #define SYS_WRITE  1
 #define SYS_EXIT   2
+#define SYS_SLEEP  3
+#define SYS_FORK   4
+#define SYS_EXEC   5
+#define SYS_WAIT   6
 
 void syscall_init();
-void syscall_handler(uint32_t eax, uint32_t ebx, uint32_t ecx, uint32_t edx) ;
-static inline void sys_exit() {
-  asm volatile("mov $2, %%eax; int $0x80" ::: "eax");
-}
-static inline int sys_write(int fd, const char *buf, int count) {
-  int ret;
-  asm volatile(
-    "mov $1, %%eax\n"
-    "int $0x80\n"
-    : "=a"(ret)
-    : "b"(fd), "c"(buf), "d"(count)
-  );
-  return ret;
-}
+int syscall_handler(uint32_t eax, uint32_t ebx, uint32_t ecx, uint32_t edx);
 #endif

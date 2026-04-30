@@ -3,7 +3,8 @@
 
 #define KB_BUFFER_SIZE 128
 
-
+extern volatile int kb_head;
+extern volatile int kb_tail;
 
 struct interrupt_frame {
     uint32_t ip, cs, flags;
@@ -11,6 +12,6 @@ struct interrupt_frame {
 
 __attribute__((interrupt))
 void keyboard_handler(struct interrupt_frame *frame);
-void kb_buf_push(char c) ;
+void kb_buf_push(char c);
 void keyboard_init(void);
 char kb_getchar();

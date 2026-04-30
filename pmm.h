@@ -3,7 +3,7 @@
 #include "kernel.h"
 #include <stdint.h>
 #define PAGE_SIZE 4096
-#define MAX_PAGES 131072
+#define MAX_PAGES 1048576  /* 1M 页 × 4KB = 4GB */
 void pmm_init(multiboot_info_t *mbi);
 uint32_t pmm_alloc();
 void pmm_free(uint32_t addr);

@@ -3,7 +3,6 @@
 #include "vga.h"
 #include "io.h" // 需要 outb
 #include "serial.h"
-static void update_hw_cursor();
 static int cursor_x = 0;
 static int cursor_y = 0;
 static char *vga = (char *)0xb8000;
@@ -27,7 +26,7 @@ void print(const char *str, unsigned char color) {
   if (color == 0)
     color = 0x07;
   for (int i = 0; str[i]; i++) {
-    // serial_putchar(str[i]); // 同步输出到串口
+    serial_putchar(str[i]); // 同步输出到串口
     if (str[i] == '\n') {
       cursor_y++;
       cursor_x = 0;

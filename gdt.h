@@ -16,5 +16,10 @@ struct gdt_ptr {
 } __attribute__((packed));
 
 void gdt_init();
+void gdt_set(int i, unsigned int base, unsigned int limit,
+             unsigned int access, unsigned int gran);
+
+#define USER_CS 0x1B
+#define USER_DS 0x23
 
 #endif
