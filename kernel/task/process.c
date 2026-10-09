@@ -1,6 +1,11 @@
 #include "process.h"
 #include "../lib/string.h"
+#include "elf.h"
+#include "fs.h"
+#include "gdt.h"
+#include "kernel.h"
 #include "pmm.h"
+#include "syscall.h"
 #include "tss.h"
 #include "vga.h"
 #include "vmm.h"
@@ -9,34 +14,165 @@ process_t processes[MAX_PROCESSES];
 int current = 0;
 int process_count = 0;
 
-extern void enter_usermode(uint32_t entry, uint32_t stack);
-extern char _user_load_start;
-extern char _user_load_end;
-extern char _user_start;
-extern char _user_end;
-extern char _user_text_load_start;
-extern char _user_text_load_end;
-extern char _user_rodata;
-extern char _user_rodata_load_start;
-extern char _user_rodata_load_end;
-
-#define USER_BASE 0x20000000u
-
-static uint32_t user_image_pages() {
-  uint32_t image_size = (uint32_t)&_user_end - (uint32_t)&_user_start;
-  return (image_size + 4095) / 4096;
+/* The iret frame of the current process's in-flight syscall, stored per
+ * process by syscall_stub.  It must not be a global: a blocking syscall can
+ * be preempted while another process enters the kernel, which would otherwise
+ * make the blocked process build signal frames on the wrong stack. */
+static uint32_t *current_iret(void) {
+  return (uint32_t *)(uintptr_t)processes[current].syscall_esp;
 }
+
+/*
+ * PIDs are monotonic and independent of the slot index.  Reaping a child
+ * compacts the process array, so using the index as the pid would silently
+ * renumber live processes; a shell waiting on a recorded pid would then wait
+ * on the wrong process (or get ECHILD).
+ */
+static uint32_t next_pid = 1;
+
+static uint32_t alloc_pid(void) { return next_pid++; }
+
+#define LOAD_ONE 2048u
+static uint32_t avenrun[3];
+static uint32_t load_ticks;
+
+/* Match the scheduler: sleeping, zombie and unprepared tasks cannot run. */
+static uint32_t count_runnable(void) {
+  uint32_t count = 0;
+  for (int i = 0; i < process_count; i++) {
+    process_t *p = &processes[i];
+    if (p->pid != 0 && p->state == PROC_RUNNING && p->sleep_ticks == 0 &&
+        (p->kernel_stack == 0 || p->started))
+      count++;
+  }
+  return count;
+}
+
+/* Called only by IRQ0, not by the syscall scheduling path. */
+void process_loadavg_tick(void) {
+  if (++load_ticks < 5 * PIT_HZ)
+    return;
+  load_ticks = 0;
+
+  static const uint32_t decay[3] = {1884, 2014, 2037};
+  uint32_t active = count_runnable() * LOAD_ONE;
+  for (int i = 0; i < 3; i++) {
+    uint32_t value = avenrun[i] * decay[i] +
+                     active * (LOAD_ONE - decay[i]);
+    /* Round upward on increasing load, as in Linux's fixed-point update. */
+    if (active >= avenrun[i])
+      value += LOAD_ONE - 1;
+    avenrun[i] = value / LOAD_ONE;
+  }
+}
+
+void process_get_loadavg(process_loadavg_t *info) {
+  uint32_t flags;
+  uint32_t snapshot[3];
+  asm volatile("pushfl; popl %0; cli" : "=r"(flags) :: "memory");
+  for (int i = 0; i < 3; i++)
+    snapshot[i] = avenrun[i];
+  info->runnable = count_runnable();
+  info->total = (uint32_t)process_count;
+  info->last_pid = next_pid - 1;
+  asm volatile("pushl %0; popfl" :: "r"(flags) : "memory", "cc");
+
+  for (int i = 0; i < 3; i++)
+    info->avg[i] = (snapshot[i] * 100 + LOAD_ONE / 2) / LOAD_ONE;
+}
+
+extern void enter_usermode(uint32_t entry, uint32_t stack);
+
+#define USER_STACK_TOP 0x28000000u
+/* 64 pages = 256 KiB: TUI programs (sfm, vi, ...) plus libc need more than the
+ * old 64 KiB, which a single large stack frame could overflow. */
+#define USER_STACK_PAGES 64u
 
 void context_switch(context_t *old, context_t *new);
 void process_enter(context_t *old, context_t *new);
 void process_jump(context_t *new);
 
+/* Point %gs at the process's TCB.  Called from the asm switch stubs too. */
+void process_set_tls(process_t *p) { gdt_set_tls_base(p->tls_base); }
+
+/*
+ * Lay out argc/argv/envp and a minimal auxv at the top of the user stack,
+ * newest at the lowest address.  The stack pages must already be mapped.
+ */
+static uint32_t user_build_stack(const char *const *args, int argc,
+                                 const char *const *envp, int envc) {
+  uint32_t sp = USER_STACK_TOP;
+  uint32_t argp[32];
+  uint32_t envpp[32];
+
+  if (argc > 32)
+    argc = 32;
+  if (envc > 32)
+    envc = 32;
+  for (int i = 0; i < argc; i++) {
+    uint32_t len = kstrlen(args[i]) + 1;
+    sp -= len;
+    kmemcpy((void *)(uintptr_t)sp, args[i], len);
+    argp[i] = sp;
+    sp &= ~3u;
+  }
+  for (int i = 0; i < envc; i++) {
+    uint32_t len = kstrlen(envp[i]) + 1;
+    sp -= len;
+    kmemcpy((void *)(uintptr_t)sp, envp[i], len);
+    envpp[i] = sp;
+    sp &= ~3u;
+  }
+
+  sp &= ~15u; // 16-byte align, as the SysV i386 ABI expects at entry
+  sp -= 8;    // padding
+  *(uint32_t *)(uintptr_t)sp = 0;
+  *(uint32_t *)(uintptr_t)(sp + 4) = 0;
+  sp -= 8; // auxv: AT_NULL (0)
+  *(uint32_t *)(uintptr_t)sp = 0;
+  *(uint32_t *)(uintptr_t)(sp + 4) = 0;
+  sp -= 4; // envp terminator
+  *(uint32_t *)(uintptr_t)sp = 0;
+  for (int i = envc - 1; i >= 0; i--) {
+    sp -= 4;
+    *(uint32_t *)(uintptr_t)sp = envpp[i];
+  }
+  sp -= 4; // argv terminator
+  *(uint32_t *)(uintptr_t)sp = 0;
+  for (int i = argc - 1; i >= 0; i--) {
+    sp -= 4;
+    *(uint32_t *)(uintptr_t)sp = argp[i];
+  }
+  sp -= 4; // argc
+  *(uint32_t *)(uintptr_t)sp = (uint32_t)argc;
+  return sp;
+}
+
+/*
+ * Point the pending syscall return at a new program.  The stub restores the
+ * pusha frame and iret's, so both the iret frame (EIP/ESP) and the saved
+ * registers live just above the kernel esp captured on syscall entry.
+ */
+static void patch_user_frame(uint32_t entry, uint32_t stack) {
+  uint32_t *iret = current_iret();
+  iret[0] = entry; // EIP
+  iret[3] = stack; // ESP_user
+
+  uint32_t *regs = iret - 8; // pusha frame: edi..eax
+  for (int i = 0; i < 8; i++)
+    regs[i] = 0;
+}
+
 void process_register_current() {
   processes[0].pid = 0;
   processes[0].started = 1;
   processes[0].kernel_stack = 0;
-  processes[process_count].state = PROC_RUNNING;
+  processes[0].state = PROC_RUNNING;
+  processes[0].pdir = vmm_kernel_pdir();
+  processes[0].mmap_next = USER_MMAP_BASE;
+  processes[0].tls_base = 0;
   kstrcpy(processes[0].process_name, "bootstrap");
+  fd_init(processes[0].fds);
   process_count = 1;
 }
 
@@ -78,6 +214,9 @@ void process_schedule() {
   int old = current;
   current = next;
 
+  process_set_tls(&processes[next]);
+  vmm_switch_pdir(processes[next].pdir);
+
   if (!processes[next].started) {
     processes[next].started = 1;
     process_enter(&processes[old].ctx, &processes[current].ctx);
@@ -98,7 +237,8 @@ void process_create_kernel(void (*entry)()) {
 
   stack_top -= 32;
 
-  processes[process_count].pid = process_count;
+  kmemset(&processes[process_count], 0, sizeof(process_t));
+  processes[process_count].pid = alloc_pid();
   processes[process_count].ctx.esp = stack_top;
   processes[process_count].ctx.ebp = 0;
   processes[process_count].ctx.ebx = 0;
@@ -107,72 +247,91 @@ void process_create_kernel(void (*entry)()) {
   processes[process_count].started = 0;
   processes[process_count].kernel_stack = 0;
   processes[process_count].state = PROC_RUNNING;
+  processes[process_count].pdir = vmm_kernel_pdir();
+  processes[process_count].mmap_next = USER_MMAP_BASE;
+  processes[process_count].tls_base = 0;
   kstrcpy(processes[process_count].process_name, "kernel_init");
+  fd_init(processes[process_count].fds);
   process_count++;
 }
 
-void process_create_user(void (*entry)()) {
+/* Environment handed to the initial shell (and inherited by everything). */
+static const char *init_envp[] = {
+    "PATH=/bin", "HOME=/", "PWD=/", "TERM=muxos", 0,
+};
+
+/*
+ * Load the initial user process from an ELF stored in the filesystem (i.e.
+ * /bin/sh) rather than an image embedded in the kernel.
+ */
+int process_create_user(void) {
   extern void print(const char *, unsigned char);
-  uint32_t image_pages = user_image_pages();
-  uint32_t code_page = USER_BASE;
-  for (uint32_t i = 0; i < image_pages; i++) {
-    if (!vmm_alloc_at(USER_BASE + i * 4096)) {
-      for (uint32_t j = 0; j < i; j++)
-        vmm_free(USER_BASE + j * 4096);
-      return;
+  uint32_t entry = 0;
+
+  struct file *f = vfs_open("/bin/sh", O_RDONLY);
+  if (!f) {
+    print("cannot open /bin/sh\n", 0x0C);
+    return -1;
+  }
+
+  uint32_t pdir = vmm_create_pdir();
+  if (!pdir) {
+    fileclose(f);
+    print("pdir alloc failed\n", 0x0C);
+    return -1;
+  }
+  if (elf_load_inode(pdir, f->ip, &entry) < 0) {
+    fileclose(f);
+    print("elf load failed\n", 0x0C);
+    return -1;
+  }
+  fileclose(f);
+  process_map_sigtramp(pdir);
+
+  uint32_t stack_base = USER_STACK_TOP - USER_STACK_PAGES * 4096u;
+  for (uint32_t i = 0; i < USER_STACK_PAGES; i++) {
+    if (!vmm_alloc_at(pdir, stack_base + i * 4096)) {
+      print("user stack map failed\n", 0x0C);
+      return -1;
     }
   }
 
-  uint8_t *text_src = (uint8_t *)&_user_text_load_start;
-  uint8_t *text_dst = (uint8_t *)USER_BASE;
-  for (uint32_t i = 0;
-       i < (uint32_t)&_user_text_load_end - (uint32_t)&_user_text_load_start;
-       i++)
-    text_dst[i] = text_src[i];
-
-  uint8_t *rodata_src = (uint8_t *)&_user_rodata_load_start;
-  uint8_t *rodata_dst = (uint8_t *)&_user_rodata;
-  for (uint32_t i = 0; i < (uint32_t)&_user_rodata_load_end -
-                               (uint32_t)&_user_rodata_load_start;
-       i++)
-    rodata_dst[i] = rodata_src[i];
-
-  // 固定布局：代码段位于 USER_BASE，用户栈位于 USER_BASE + 64KiB 之后，
-  // 避免 vmm_alloc() 在用户地址空间中分配到错误的低地址页，并造成
-  // 代码页/栈页发生重叠或错位。
-  uint32_t user_stack_base = USER_BASE + 0x10000u;
-  for (uint32_t i = 0; i < 4; i++) {
-    if (!vmm_alloc_at(user_stack_base + i * 4096)) {
-      for (uint32_t j = 0; j < image_pages; j++)
-        vmm_free(USER_BASE + j * 4096);
-      for (uint32_t j = 0; j < i; j++)
-        vmm_free(user_stack_base + j * 4096);
-      return;
-    }
-  }
-  /* 栈向低地址增长，栈顶应位于四个已映射页之后。 */
-  uint32_t user_stack = user_stack_base + 4 * 4096;
+  /* Build the stack through the new address space. */
+  uint32_t old_pdir = vmm_current_pdir();
+  vmm_switch_pdir(pdir);
+  static const char *init_argv[] = {"sh", 0};
+  uint32_t user_stack = user_build_stack(init_argv, 1, init_envp, 4);
+  vmm_switch_pdir(old_pdir);
 
   /* 内核栈必须在内核区（无 PAGE_USER），不能用 vmm_alloc */
   uint32_t kernel_stack = pmm_alloc();
-  if (!kernel_stack) {
-    return;
-  }
+  if (!kernel_stack)
+    return -1;
   kernel_stack += 4096;
 
-  processes[process_count].pid = process_count;
-  processes[process_count].ctx.esp = code_page;
+  kmemset(&processes[process_count], 0, sizeof(process_t));
+  uint32_t pid = alloc_pid();
+  processes[process_count].pid = pid;
+  processes[process_count].pgid = pid;
+  processes[process_count].sid = pid;
+  foreground_pgid = (int)pid;
+  processes[process_count].ctx.esp = entry;
   processes[process_count].ctx.ebp = user_stack;
   processes[process_count].ctx.ebx = 0;
   processes[process_count].ctx.esi = 0;
   processes[process_count].ctx.edi = 0;
   processes[process_count].started = 0;
   processes[process_count].kernel_stack = kernel_stack;
-  processes[process_count].user_code = code_page;
+  processes[process_count].user_code = entry;
   processes[process_count].user_stack = user_stack;
   processes[process_count].state = PROC_RUNNING;
   processes[process_count].parent_pid = 0;
+  processes[process_count].pdir = pdir;
+  processes[process_count].mmap_next = USER_MMAP_BASE;
+  processes[process_count].tls_base = 0;
+  fd_init(processes[process_count].fds);
   process_count++;
+  return (int)pid;
 }
 
 void start_user_process(int pid, char *process_name) {
@@ -209,6 +368,13 @@ void start_user_process(int pid, char *process_name) {
 void process_exit() {
   process_t *p = &processes[current];
 
+  for (int i = 0; i < FD_MAX; i++) {
+    if (p->fds[i]) {
+      fileclose(p->fds[i]);
+      p->fds[i] = 0;
+    }
+  }
+
   if (p->parent_pid > 0) {
     // 有父进程：变成僵尸，唤醒父进程
     p->state = PROC_ZOMBIE;
@@ -224,21 +390,16 @@ void process_exit() {
     return;
   }
 
-  /* 无父进程：直接释放内存并删除 */
-  if (p->kernel_stack != 0) {
-    if (p->user_code) {
-      for (uint32_t i = 0; i < user_image_pages(); i++)
-        vmm_free(p->user_code + i * 4096);
-    }
-    if (p->user_stack) {
-      for (int i = 0; i < 4; i++)
-        vmm_free(p->user_stack - 4096 * (i + 1));
-    }
+  /* 无父进程：释放地址空间并删除。先切回内核页目录，才能销毁当前页目录。 */
+  uint32_t dying_pdir = p->pdir;
+  vmm_switch_pdir(vmm_kernel_pdir());
+  if (dying_pdir && dying_pdir != vmm_kernel_pdir())
+    vmm_destroy_pdir(dying_pdir);
+  if (p->kernel_stack != 0)
     pmm_free(p->kernel_stack - 4096);
-  }
 
   for (int i = current; i < process_count - 1; i++)
-    processes[i] = processes[i + 1];
+    kmemcpy(&processes[i], &processes[i + 1], sizeof(process_t));
   process_count--;
 
   if (process_count == 0) {
@@ -252,6 +413,8 @@ void process_exit() {
   if (current == 0 && process_count > 1)
     current = 1;
 
+  process_set_tls(&processes[current]);
+  vmm_switch_pdir(processes[current].pdir);
   processes[current].started = 1;
   process_jump(&processes[current].ctx);
 }
@@ -294,136 +457,372 @@ int process_tick() {
 
 void process_sleep(uint32_t ticks) { processes[current].sleep_ticks = ticks; }
 
+/* Free a zombie's resources and remove it from the process table. */
+static int reap_child(int i) {
+  int pid = processes[i].pid;
+  uint32_t cpdir = processes[i].pdir;
+  if (processes[i].kernel_stack)
+    pmm_free(processes[i].kernel_stack - 4096);
+  if (cpdir && cpdir != vmm_kernel_pdir())
+    vmm_destroy_pdir(cpdir);
+  for (int j = i; j < process_count - 1; j++)
+    kmemcpy(&processes[j], &processes[j + 1], sizeof(process_t));
+  process_count--;
+  if (current > i)
+    current--;
+  if (current >= process_count)
+    current = 0;
+  return pid;
+}
+
 // Reap a zombie child. Returns child pid, or -1 if no zombie child exists.
 // If no zombie but has children, sleeps briefly so scheduler can run children.
 int process_wait() {
   uint32_t my_pid = processes[current].pid;
   for (int i = 0; i < process_count; i++) {
-    if (processes[i].parent_pid == my_pid &&
-        processes[i].state == PROC_ZOMBIE) {
-      int pid = processes[i].pid;
-      // free child's memory (fork child has 1 stack page)
-      if (processes[i].user_code)
-        vmm_free(processes[i].user_code);
-      if (processes[i].user_stack)
-        vmm_free(processes[i].user_stack - 4096);
-      if (processes[i].kernel_stack)
-        pmm_free(processes[i].kernel_stack - 4096);
-      // remove from array
-      for (int j = i; j < process_count - 1; j++)
-        processes[j] = processes[j + 1];
-      process_count--;
-      if (current > i)
-        current--;
-      return pid;
-    }
+    if (processes[i].parent_pid == my_pid && processes[i].state == PROC_ZOMBIE)
+      return reap_child(i);
   }
-  // no zombie yet — sleep so scheduler can run children
   processes[current].sleep_ticks = 10;
   return -1;
 }
 
-// set by syscall_stub before calling syscall_handler
-uint32_t syscall_kernel_esp = 0;
+/*
+ * POSIX-ish waitpid.  `pid` may be a specific child (the common case for a
+ * shell) or <= 0 for "any child".  Returns the reaped pid, 0 if WNOHANG and
+ * nothing is ready, -ECHILD if there are no matching children, or -EAGAIN so
+ * the caller can yield and retry.  WUNTRACED/WCONTINUED are not implemented.
+ */
+#define WNOHANG_K 1
+int process_waitpid(int pid, int flags, int *status) {
+  uint32_t my_pid = processes[current].pid;
+  int have_child = 0;
+
+  for (int i = 0; i < process_count; i++) {
+    if (processes[i].parent_pid != my_pid)
+      continue;
+    if (pid > 0 && (int)processes[i].pid != pid)
+      continue;
+    if (processes[i].state == PROC_ZOMBIE) {
+      if (status)
+        *status = (int)((processes[i].exit_code & 0xFF) << 8); /* WIFEXITED */
+      return reap_child(i);
+    }
+    have_child = 1;
+  }
+
+  if (!have_child)
+    return -ECHILD;
+  if (flags & WNOHANG_K)
+    return 0;
+  return -EAGAIN;
+}
 
 int process_fork(uint32_t child_eax_ret) {
-  extern void print(const char *, unsigned char);
-  print("fork start\n", 0x0E);
-  process_t *p = &processes[current];
-  uint32_t parent_pid = p->pid;
+  (void)child_eax_ret;
+  process_t *parent = &processes[current];
+
   if (process_count >= MAX_PROCESSES)
     return -1;
 
-  // allocate new code page and copy user code
-  extern void user_c_start();
-  extern void user_c_end();
-  uint32_t start = (uint32_t)&user_c_start;
-  uint32_t end = (uint32_t)&user_c_end;
-  uint32_t code_size = end - start;
-  if (code_size > 4096)
-    code_size = 4096;
-
-  uint32_t code_page = vmm_alloc();
-  if (!code_page)
+  /* Private address space: kernel PDEs plus a deep copy of every user page. */
+  uint32_t cpdir = vmm_create_pdir();
+  if (!cpdir)
     return -1;
-  uint8_t *src = (uint8_t *)start;
-  uint8_t *dst = (uint8_t *)code_page;
-  for (uint32_t i = 0; i < code_size; i++)
-    dst[i] = src[i];
+  vmm_copy_pdir(cpdir, parent->pdir);
 
-  // allocate new user stack (1 page) and copy parent's top stack page
-  uint32_t child_user_stack_base = vmm_alloc();
-  if (!child_user_stack_base)
+  /* Copy the kernel stack so the child resumes from the same syscall. */
+  uint32_t ckstack = pmm_alloc();
+  if (!ckstack) {
+    vmm_destroy_pdir(cpdir);
     return -1;
-  uint32_t child_user_stack_top = child_user_stack_base + 4096;
+  }
+  if (parent->kernel_stack)
+    kmemcpy((void *)(uintptr_t)ckstack,
+            (void *)(uintptr_t)(parent->kernel_stack - 4096), 4096);
+  uint32_t cktop = ckstack + 4096;
 
-  // copy parent's top stack page (where the active stack frame lives)
-  uint32_t parent_top_page = p->user_stack - 4096;
-  uint8_t *usrc = (uint8_t *)(uintptr_t)parent_top_page;
-  uint8_t *udst = (uint8_t *)(uintptr_t)child_user_stack_base;
-  for (int i = 0; i < 4096; i++)
-    udst[i] = usrc[i];
+  int child = process_count;
+  process_t *c = &processes[child];
+  kmemset(c, 0, sizeof(*c));
+  c->pid = alloc_pid();
+  c->parent_pid = parent->pid;
+  c->pdir = cpdir;
+  c->kernel_stack = cktop;
+  c->user_code = parent->user_code;
+  c->user_stack = parent->user_stack;
+  c->mmap_next = parent->mmap_next;
+  c->tls_base = parent->tls_base;
+  c->pgid = parent->pgid;
+  c->sid = parent->sid;
+  c->state = PROC_RUNNING;
+  /* ctx.esp already points at a complete pusha/iret frame, so the child is
+   * immediately runnable (unlike process_create_user, which needs the stub's
+   * first-run handling). */
+  c->started = 1;
+  kstrcpy(c->process_name, parent->process_name);
+  fd_fork(parent->fds, c->fds);
 
-  // allocate new kernel stack and copy parent's kernel stack
-  uint32_t parent_kstack_base = processes[current].kernel_stack - 4096;
-  uint32_t child_kstack = pmm_alloc();
-  if (!child_kstack)
-    return -1;
-  uint8_t *ksrc = (uint8_t *)(uintptr_t)parent_kstack_base;
-  uint8_t *kdst = (uint8_t *)(uintptr_t)child_kstack;
-  for (int i = 0; i < 4096; i++)
-    kdst[i] = ksrc[i];
-  uint32_t child_kstack_top = child_kstack + 4096;
+  /*
+   * The CPU left the ring-3 registers in a pusha frame just below the iret
+   * frame at syscall entry.  Point the child at the copy of that frame and
+   * zero its eax so fork() returns 0 in the child.
+   */
+  uint32_t child_pusha =
+      cktop - (parent->kernel_stack - (processes[current].syscall_esp - 32));
+  c->ctx.esp = child_pusha;
+  *(uint32_t *)(uintptr_t)(child_pusha + 28) = 0; // eax
 
-  // compute child's kernel esp: same offset from stack base as parent
-  uint32_t esp_offset = processes[current].kernel_stack - syscall_kernel_esp;
-  uint32_t child_iret_esp = child_kstack_top - esp_offset;
-
-  // syscall_stub now does pusha before saving syscall_kernel_esp? No:
-  // syscall_kernel_esp is saved BEFORE pusha, so:
-  //   child_iret_esp = child_kstack_top - (kernel_stack - syscall_kernel_esp)
-  //   parent pusha frame is at syscall_kernel_esp - 32
-  //   child pusha frame is at child_iret_esp - 32
-  uint32_t child_pusha_esp = child_iret_esp - 32;
-
-  // copy parent's pusha frame (contains real user registers including ebp)
-  uint32_t parent_pusha_esp = syscall_kernel_esp - 32;
-  uint32_t *src_pusha = (uint32_t *)(uintptr_t)parent_pusha_esp;
-  uint32_t *dst_pusha = (uint32_t *)(uintptr_t)child_pusha_esp;
-  for (int i = 0; i < 8; i++)
-    dst_pusha[i] = src_pusha[i];
-  // patch eax = child return value (0)
-  dst_pusha[7] = child_eax_ret;
-
-  uint32_t child_esp = child_pusha_esp;
-
-  // patch iret frame: update ESP_user to child's stack
-  uint32_t *child_iret = (uint32_t *)(uintptr_t)child_iret_esp;
-  uint32_t parent_user_esp = child_iret[3];
-  uint32_t offset_from_top = p->user_stack - parent_user_esp;
-  child_iret[3] = child_user_stack_top - offset_from_top;
-
-  int child_idx = process_count;
-  processes[child_idx].pid = process_count + 1;
-  processes[child_idx].ctx.esp = child_esp;
-  processes[child_idx].ctx.ebp = 0;
-  processes[child_idx].ctx.ebx = 0;
-  processes[child_idx].ctx.esi = 0;
-  processes[child_idx].ctx.edi = 0;
-  processes[child_idx].state = 1;
-  processes[child_idx].started = 1;
-  processes[child_idx].kernel_stack = child_kstack_top;
-  processes[child_idx].sleep_ticks = 0;
-  processes[child_idx].user_code = code_page;
-  processes[child_idx].user_stack = child_user_stack_top;
-  processes[current].state = PROC_RUNNING;
-  processes[child_idx].parent_pid = parent_pid;
   process_count++;
-
-  return processes[child_idx].pid;
+  return (int)c->pid;
 }
 
-int process_current_pid() { return current; }
+/*
+ * Replace the current process image with the ELF stored at `path`.  argv is
+ * snapshotted first because loading the new image overwrites user memory.
+ * On success the pending syscall return points at the new entry point and
+ * this returns 0; on failure it returns a negative errno.
+ */
+/* Copy a user string vector into kernel buffers before we overwrite user mem.
+ */
+static int snapshot_vec(const char *const *uvec, char *buf, uint32_t bufsz,
+                        const char **kvec, int max) {
+  int n = 0;
+  uint32_t used = 0;
+  if (uvec) {
+    while (n < max && uvec[n] && used < bufsz - 1) {
+      const char *s = uvec[n];
+      uint32_t j = 0;
+      while (s[j] && used + j < bufsz - 1) {
+        buf[used + j] = s[j];
+        j++;
+      }
+      buf[used + j] = 0;
+      kvec[n] = &buf[used];
+      used += j + 1;
+      n++;
+    }
+  }
+  return n;
+}
+
+int process_execve(const char *path, const char *const *uargv,
+                   const char *const *uenvp) {
+  struct file *f = vfs_open(path, O_RDONLY);
+  if (!f)
+    return -fs_errno;
+  if (f->ip->type != T_FILE) {
+    fileclose(f);
+    return -EACCES;
+  }
+
+  static char argbuf[1024];
+  static char envbuf[2048];
+  const char *kargv[32];
+  const char *kenvp[32];
+  int argc = snapshot_vec(uargv, argbuf, sizeof(argbuf), kargv, 32);
+  int envc = snapshot_vec(uenvp, envbuf, sizeof(envbuf), kenvp, 32);
+  if (argc == 0) {
+    argbuf[0] = 0;
+    kargv[0] = argbuf;
+    argc = 1;
+  }
+
+  uint32_t entry;
+  if (elf_load_inode(processes[current].pdir, f->ip, &entry) < 0) {
+    fileclose(f);
+    return -ENOEXEC;
+  }
+  fileclose(f);
+
+  process_map_sigtramp(processes[current].pdir);
+  mmap_reset();
+  uint32_t user_stack = user_build_stack(kargv, argc, kenvp, envc);
+  patch_user_frame(entry, user_stack);
+  processes[current].user_code = entry;
+  processes[current].user_stack = user_stack;
+  return 0;
+}
+
+/* --- signals, process groups and sessions ------------------------------ */
+
+/* Where the SIGRETURN trampoline is mapped in every user address space. */
+#define SIGRETURN_TRAMPOLINE 0x40000000u
+
+int foreground_pgid = 0;
+
+/* Map a tiny "mov eax, SYS_SIGRETURN; int 0x80" stub so a handler can return.
+ */
+void process_map_sigtramp(uint32_t pdir) {
+  if (vmm_page_present(pdir, SIGRETURN_TRAMPOLINE))
+    return;
+  if (!vmm_alloc_at(pdir, SIGRETURN_TRAMPOLINE))
+    return;
+  uint8_t code[7] = {0xB8, (uint8_t)(SYS_SIGRETURN & 0xFF), 0, 0, 0, 0xCD,
+                     0x80};
+  uint32_t phys = vmm_phys(pdir, SIGRETURN_TRAMPOLINE);
+  if (phys)
+    kmemcpy((void *)(uintptr_t)phys, code, sizeof(code));
+}
+
+int process_sigaction(int sig, const void *act, void *old) {
+  if (sig <= 0 || sig >= 64)
+    return -EINVAL;
+  process_t *p = &processes[current];
+  /* Signals >= 32 (e.g. mlibc's SIGCANCEL) are accepted but not delivered. */
+  if (sig < 32) {
+    if (old)
+      *(uint32_t *)old = p->sig_handler[sig];
+    if (act)
+      p->sig_handler[sig] = *(const uint32_t *)act;
+  } else if (old) {
+    *(uint32_t *)old = 0;
+  }
+  return 0;
+}
+
+int process_kill(int pid, int sig) {
+  if (sig < 0 || sig >= 64)
+    return -EINVAL;
+  process_t *me = &processes[current];
+  int sent = 0;
+
+  for (int i = 0; i < process_count; i++) {
+    process_t *t = &processes[i];
+    if (t->pid == 0)
+      continue;
+    int match;
+    if (pid > 0)
+      match = ((int)t->pid == pid);
+    else if (pid == 0)
+      match = (t->pgid == me->pgid);
+    else
+      match = (t->pgid == (uint32_t)(-pid));
+    if (match) {
+      /* sig == 0 is the existence check; >= 32 (e.g. SIGCANCEL) is ignored. */
+      if (sig > 0 && sig < 32)
+        t->sig_pending |= (1u << sig);
+      sent = 1;
+    }
+  }
+  return sent ? 0 : -ESRCH;
+}
+
+/* Restore the context saved when a handler was entered.  Returns the saved
+ * eax so the syscall stub writes it back (it otherwise clobbers eax). */
+int process_sigreturn(void) {
+  process_t *p = &processes[current];
+  uint32_t *iret = current_iret();
+  uint32_t *regs = iret - 8;
+
+  iret[0] = p->sig_saved.eip;
+  iret[1] = p->sig_saved.cs;
+  iret[2] = p->sig_saved.eflags;
+  iret[3] = p->sig_saved.esp;
+  iret[4] = p->sig_saved.ss;
+  for (int i = 0; i < 8; i++)
+    regs[i] = p->sig_saved.regs[i];
+  p->in_signal = 0;
+  return (int)p->sig_saved.regs[7];
+}
+
+/*
+ * Deliver one pending signal to the current process, just before it returns to
+ * user mode.  Returns 1 if a handler was entered (the iret frame now points at
+ * it), 0 otherwise.  Default actions may terminate the process (no return).
+ */
+int signal_deliver(void) {
+  process_t *p = &processes[current];
+  if (p->in_signal)
+    return 0;
+
+  uint32_t pend = p->sig_pending & ~p->sig_blocked;
+  if (!pend)
+    return 0;
+
+  for (int sig = 1; sig < 32; sig++) {
+    if (!(pend & (1u << sig)))
+      continue;
+    p->sig_pending &= ~(1u << sig);
+
+    uint32_t h = p->sig_handler[sig];
+    if (h == 1) /* SIG_IGN */
+      continue;
+
+    if (h == 0) {
+      /* SIG_DFL */
+      if (sig == SIGCHLD || sig == SIGCONT || sig == SIGURG ||
+          sig == SIGWINCH || sig == SIGTSTP || sig == SIGTTIN ||
+          sig == SIGTTOU || sig == SIGSTOP)
+        continue; /* ignored / stop unsupported */
+      p->exit_code = 128 + (uint32_t)sig;
+      process_exit();
+      return 1; /* not reached */
+    }
+
+    uint32_t *iret = current_iret();
+    uint32_t *regs = iret - 8;
+    p->sig_saved.eip = iret[0];
+    p->sig_saved.cs = iret[1];
+    p->sig_saved.eflags = iret[2];
+    p->sig_saved.esp = iret[3];
+    p->sig_saved.ss = iret[4];
+    for (int r = 0; r < 8; r++)
+      p->sig_saved.regs[r] = regs[r];
+
+    /* handler(sig): push the return address and the argument. */
+    uint32_t usp = iret[3] - 8;
+    *(uint32_t *)(uintptr_t)(usp + 4) = (uint32_t)sig;
+    *(uint32_t *)(uintptr_t)usp = SIGRETURN_TRAMPOLINE;
+    iret[0] = h;   /* EIP */
+    iret[3] = usp; /* ESP_user */
+    p->in_signal = 1;
+    return 1;
+  }
+  return 0;
+}
+
+int process_setpgid(int pid, int pgid) {
+  if (pid == 0)
+    pid = (int)processes[current].pid;
+  if (pgid == 0)
+    pgid = pid;
+  for (int i = 0; i < process_count; i++) {
+    if ((int)processes[i].pid == pid) {
+      processes[i].pgid = (uint32_t)pgid;
+      return 0;
+    }
+  }
+  return -ESRCH;
+}
+
+int process_getpgid(int pid) {
+  if (pid == 0)
+    pid = (int)processes[current].pid;
+  for (int i = 0; i < process_count; i++)
+    if ((int)processes[i].pid == pid)
+      return (int)processes[i].pgid;
+  return -ESRCH;
+}
+
+int process_getsid(int pid) {
+  if (pid == 0)
+    pid = (int)processes[current].pid;
+  for (int i = 0; i < process_count; i++)
+    if ((int)processes[i].pid == pid)
+      return (int)processes[i].sid;
+  return -ESRCH;
+}
+
+int process_setsid(void) {
+  process_t *p = &processes[current];
+  p->sid = p->pid;
+  p->pgid = p->pid;
+  foreground_pgid = (int)p->pid;
+  return (int)p->pid;
+}
+
+int process_current_pid() { return (int)processes[current].pid; }
 int process_get_info(uint32_t pid, process_info_t *info) {
   for (int i = 0; i < process_count; i++) {
     if (processes[i].pid == pid) {

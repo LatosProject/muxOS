@@ -6,22 +6,26 @@ global syscall_stub
 global isr6_stub
 global isr14_stub
 extern process_tick
+extern process_loadavg_tick
 extern syscall_handler
 extern isr6_handler
 extern isr14_handler
 extern processes
 extern current
 extern process_count
-extern syscall_kernel_esp
 extern tss_set_kernel_stack
+extern process_set_tls
+extern signal_deliver
 
 ; process_t 各字段在结构体中的偏移（与 process.h 保持同步）
-PROCESS_SIZE      equ 184 ; sizeof(process_t)
+PROCESS_SIZE      equ 464 ; sizeof(process_t) (guarded by _Static_assert in process.h)
 CTX_ESP_OFF       equ 4   ; offsetof(process_t, ctx.esp)
 STATE_OFF         equ 24  ; offsetof(process_t, state)
 STARTED_OFF       equ 28  ; offsetof(process_t, started)
 KERNEL_STACK_OFF  equ 32  ; offsetof(process_t, kernel_stack)
 SLEEP_TICKS_OFF   equ 36  ; offsetof(process_t, sleep_ticks)
+PDIR_OFF          equ 248 ; offsetof(process_t, pdir)
+SYSCALL_ESP_OFF   equ 460 ; offsetof(process_t, syscall_esp)
 PROC_ZOMBIE       equ 2
 
 ; -----------------------------------------------------------------------
@@ -92,6 +96,9 @@ irq0_stub:
     mov al, 0x20
     out 0x20, al
 
+    ; Load accounting uses real timer interrupts, never syscall calls.
+    call process_loadavg_tick
+
     ; 在调用 process_tick 之前保存旧的 current 索引
     ; process_tick 内部会更新 current，之后就拿不到旧值了
     mov esi, [current]
@@ -130,6 +137,15 @@ irq0_stub:
     pop eax                           ; 恢复 &processes[new]
 
 .kernel_stack_ready:
+    ; 恢复目标进程的 %gs 基址（mlibc TCB）
+    push eax
+    push eax
+    call process_set_tls
+    add esp, 4
+    pop eax
+    ; 切换到新进程的地址空间
+    mov ecx, [eax + PDIR_OFF]
+    mov cr3, ecx
     ; 切换内核栈到新进程保存的 esp
     mov esp, [eax + CTX_ESP_OFF]
 
@@ -143,6 +159,7 @@ irq0_stub:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ax, 0x33        ; 用户 TLS 选择子（%gs base 由 set_thread_area 设置）
     mov gs, ax
 
 .done:
@@ -154,6 +171,7 @@ irq0_stub:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ax, 0x33
     mov gs, ax
 .segments_restored:
     popa ; pop 寄存器
@@ -177,19 +195,32 @@ syscall_stub:
     mov gs, ax
     pop eax
 
-    ; 保存当前内核栈指针供 sys_fork 使用
-    ; 此时 esp 指向 iret 帧（EIP,CS,EFLAGS,ESP_user,SS_user）
-    mov [syscall_kernel_esp], esp
-
     ; 保存所有用户态寄存器（供 fork 复制完整现场）
     pusha
 
-    ; 按 C 调用约定从右到左压参数，调用 syscall_handler(eax,ebx,ecx,edx)
-    ; 从 pusha 帧里取出原始参数
+    ; 记录本次系统调用的 iret 帧指针，按进程保存，避免它被其它进程的
+    ; 系统调用覆盖（否则阻塞返回后投递信号会写错栈帧）。
+    ; pusha 之后 iret 帧位于 esp+32。
+    mov ecx, [current]
+    imul ecx, PROCESS_SIZE
+    mov edx, processes
+    add ecx, edx
+    lea eax, [esp + 32]
+    mov [ecx + SYSCALL_ESP_OFF], eax
+
+    ; 按 C 调用约定从右到左压参数
+    ; syscall_handler(eax, ebx, ecx, edx, esi, edi, ebp)
+    ; 从 pusha 帧里取出原始参数（pusha 布局见 irq0_stub 注释）
     mov eax, [esp + 28]   ; eax (syscall number)
     mov ebx, [esp + 16]   ; ebx (arg1)
     mov ecx, [esp + 24]   ; ecx (arg2)
     mov edx, [esp + 20]   ; edx (arg3)
+    mov esi, [esp + 4]    ; esi (arg4)
+    mov edi, [esp + 0]    ; edi (arg5)
+    mov ebp, [esp + 8]    ; ebp (arg6)
+    push ebp
+    push edi
+    push esi
     push edx
     push ecx
     push ebx
@@ -197,9 +228,14 @@ syscall_stub:
     call syscall_handler
     ; Blocking handlers can enable IRQs; keep return and scheduling atomic.
     cli
-    ; patch eax return value back into pusha frame
-    mov [esp + 44], eax         ; 清理 4 个参数后，pusha.eax 位于 esp+44
-    add esp, 16         ; 清除压入的 4 个参数
+    ; patch eax return value back into pusha frame (7 args = 28 bytes above)
+    mov [esp + 56], eax
+    add esp, 28           ; 清除压入的 7 个参数
+
+    ; 返回用户态前投递挂起的信号（可能改写 iret 帧进入 handler）
+    call signal_deliver
+    test eax, eax
+    jnz .no_sleep
 
     ; 检查当前进程是否是 ZOMBIE（SYS_EXIT 设置）或 sleep_ticks > 0
     mov ecx, [current]
@@ -262,11 +298,18 @@ syscall_stub:
     add esp, 4
     pop eax                           ; 恢复 &processes[new]
 .zombie_tss_ready:
+    push eax
+    push eax
+    call process_set_tls
+    add esp, 4
+    pop eax
     mov ecx, [eax + STARTED_OFF]
     test ecx, ecx
     jnz .zombie_switch_started
     mov dword [eax + STARTED_OFF], 1
 .zombie_switch_started:
+    mov ecx, [eax + PDIR_OFF]
+    mov cr3, ecx
     mov esp, [eax + CTX_ESP_OFF]
     jmp .sleep_done
 
@@ -292,12 +335,19 @@ syscall_stub:
     pop eax                           ; 恢复 &processes[new]
 
 .sleep_tss_ready:
+    push eax
+    push eax
+    call process_set_tls
+    add esp, 4
+    pop eax
     mov ecx, [eax + STARTED_OFF]
     test ecx, ecx
     jnz .sleep_already_started
     mov dword [eax + STARTED_OFF], 1
 
 .sleep_already_started:
+    mov ecx, [eax + PDIR_OFF]
+    mov cr3, ecx
     mov esp, [eax + CTX_ESP_OFF]
 
 .sleep_done:
@@ -311,7 +361,12 @@ syscall_stub:
     mov ds, ax
     mov es, ax
     mov fs, ax
-    mov gs, ax
+    mov bx, 0x10
+    test dword [esp + 36], 3
+    jz .return_gs_ready
+    mov bx, 0x33
+.return_gs_ready:
+    mov gs, bx
     popa
     iret
 
@@ -372,6 +427,7 @@ process_enter:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ax, 0x33
     mov gs, ax
 .ke:
     popa
@@ -394,6 +450,7 @@ process_jump:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ax, 0x33
     mov gs, ax
 .jump_kernel:
     popa

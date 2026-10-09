@@ -17,8 +17,6 @@ void pmm_mark_free(uint32_t start, uint32_t length);
 void pmm_mark_used(uint32_t start, uint32_t length);
 
 extern uint32_t _kernel_end;
-/* 用户镜像的 LMA 位于内核镜像之后，也必须在首次复制前保留。 */
-extern uint32_t _user_load_end;
 
 /*
  * pmm_init - Initialize physical memory manager
@@ -49,16 +47,19 @@ void pmm_init(multiboot_info_t *mbi) {
     }
   }
 
-  /*
-   * 保留内核及其紧随其后的用户镜像加载区。_kernel_end 只指向用户
-   * 镜像 LMA 的起点；若只保留到那里，后续 pmm_alloc 会覆写用户代码尾部。
-   */
-  uint32_t reserved_end = (uint32_t)(uintptr_t)&_user_load_end;
-  if (reserved_end < (uint32_t)(uintptr_t)&_kernel_end)
-    reserved_end = (uint32_t)(uintptr_t)&_kernel_end;
+  /* 保留内核镜像自身（含内嵌的用户 ELF blob）。 */
+  uint32_t reserved_end = (uint32_t)(uintptr_t)&_kernel_end;
   pmm_mark_used(0x100000, reserved_end - 0x100000);
   print("[OK] PMM init\n", 0);
 }
+
+/*
+ * Roving allocation hint.  Scanning the bitmap from 0 on every allocation is
+ * O(used_pages) per call, which makes fork/exec (hundreds of allocations)
+ * quadratic once /bin has been unpacked into memory.  Start where the last
+ * allocation stopped instead.
+ */
+static uint32_t pmm_hint = 0;
 
 /*
  * pmm_alloc - Allocate a single physical page
@@ -73,18 +74,57 @@ uint32_t pmm_alloc() {
    * 返回的物理页会被内核作为普通指针访问（页表、TSS 的 esp0 栈等）。
    * 因而不能分配到 vmm_init 尚未恒等映射的高端物理内存。
    */
-  for (uint32_t i = 0; i < PMM_IDENTITY_MAPPED_LIMIT / PAGE_SIZE; i++) {
-    if (!(bitmap[i / 8] & (1 << (i % 8)))) {
-      bitmap[i / 8] |= (1 << (i % 8));
+  const uint32_t total = PMM_IDENTITY_MAPPED_LIMIT / PAGE_SIZE;
+
+  for (uint32_t n = 0; n < total; n++) {
+    uint32_t i = pmm_hint;
+    if (++pmm_hint >= total)
+      pmm_hint = 0;
+    uint8_t mask = (uint8_t)(1u << (i & 7));
+    if (!(bitmap[i >> 3] & mask)) {
+      bitmap[i >> 3] |= mask;
       return i * PAGE_SIZE;
     }
   }
   PANIC("No free memory pages available");
 }
 
+/*
+ * pmm_alloc_contig - Allocate `pages` physically contiguous pages.
+ *
+ * The legacy virtio ring layout the device computes depends on the descriptor
+ * table, available ring and used ring living in one contiguous, page-aligned
+ * block, so single-page pmm_alloc() is not enough.  Scan the whole bitmap
+ * (called rarely, at device init) for a run of free pages.
+ *
+ * Returns the physical address of the first page, or 0 on failure.
+ */
+uint32_t pmm_alloc_contig(uint32_t pages) {
+  const uint32_t total = PMM_IDENTITY_MAPPED_LIMIT / PAGE_SIZE;
+  if (pages == 0 || pages > total)
+    return 0;
+
+  uint32_t run = 0, start = 0;
+  for (uint32_t i = 0; i < total; i++) {
+    uint8_t mask = (uint8_t)(1u << (i & 7));
+    if (!(bitmap[i >> 3] & mask)) {
+      if (run == 0)
+        start = i;
+      if (++run == pages) {
+        for (uint32_t j = start; j < start + pages; j++)
+          bitmap[j >> 3] |= (uint8_t)(1u << (j & 7));
+        return start * PAGE_SIZE;
+      }
+    } else {
+      run = 0;
+    }
+  }
+  return 0;
+}
+
 void pmm_free(uint32_t addr) {
   uint32_t page = addr / PAGE_SIZE;
-  bitmap[page / 8] &= ~(1 << (page % 8));
+  bitmap[page >> 3] &= (uint8_t)~(1u << (page & 7));
 }
 
 /*
@@ -98,7 +138,7 @@ void pmm_mark_free(uint32_t start, uint32_t length) {
   uint32_t page = start / PAGE_SIZE;
   uint32_t count = length / PAGE_SIZE;
   for (uint32_t i = page; i < page + count; i++)
-    bitmap[i / 8] &= ~(1 << (i % 8));
+    bitmap[i >> 3] &= (uint8_t)~(1u << (i & 7));
 }
 
 /*
@@ -113,5 +153,28 @@ void pmm_mark_used(uint32_t start, uint32_t length) {
   uint32_t page = start / PAGE_SIZE;
   uint32_t count = (length + PAGE_SIZE - 1) / PAGE_SIZE;
   for (uint32_t i = page; i < page + count; i++)
-    bitmap[i / 8] |= (1 << (i % 8));
+    bitmap[i >> 3] |= (uint8_t)(1u << (i & 7));
+}
+
+void pmm_get_info(memory_info_t *info) {
+  if (!info)
+    return;
+
+  const uint32_t total_pages = PMM_IDENTITY_MAPPED_LIMIT / PAGE_SIZE;
+
+  uint32_t free_pages = 0;
+  uint32_t used_pages = 0;
+
+  for (uint32_t i = 0; i < total_pages; i++) {
+    uint8_t mask = (uint8_t)(1u << (i & 7));
+
+    if (bitmap[i >> 3] & mask)
+      used_pages++;
+    else
+      free_pages++;
+  }
+
+  info->total = total_pages * PAGE_SIZE;
+  info->free = free_pages * PAGE_SIZE;
+  info->used = used_pages * PAGE_SIZE;
 }

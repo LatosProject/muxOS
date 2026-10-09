@@ -12,9 +12,11 @@ CompileFlags:
     - -Ikernel/lib
     - -Ikernel/mm
     - -Ikernel/task
+    - -Ikernel/fs
+    - -Ikernel/tty
     - -Idrivers/input
     - -Idrivers/platform
     - -Idrivers/serial
     - -Idrivers/video
-    - -Iuser/bin
-    - -Iuser/lib
+    - -Idrivers/bus
+    - -Idrivers/virtio

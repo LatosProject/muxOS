@@ -2,7 +2,8 @@
 #define KERNEL_H
 
 #include <stdint.h>
-#define KERNEL_VERSION "0.0.1"
+#define PIT_HZ 1000u
+#define KERNEL_VERSION "0.0.1\n"
 #define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002
 
 #define PANIC(msg) panic(msg)
@@ -89,6 +90,6 @@ struct multiboot_mmap_entry {
 
 typedef struct multiboot_mmap_entry multiboot_memory_map_t;
 
-void panic(const char *message);
+__attribute__((noreturn)) void panic(const char *message);
 
 #endif

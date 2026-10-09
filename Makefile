@@ -1,5 +1,6 @@
 # Toolchain -------------------------------------------------------------------
 CC            := $(shell command -v i686-elf-gcc 2>/dev/null || echo i686-elf-gcc)
+OBJCOPY       := $(shell command -v i686-elf-objcopy 2>/dev/null || echo i686-elf-objcopy)
 NASM          := $(shell command -v nasm 2>/dev/null || echo nasm)
 GRUB_MKRESCUE := $(shell command -v i686-elf-grub-mkrescue 2>/dev/null || command -v grub-mkrescue 2>/dev/null || echo grub-mkrescue)
 QEMU          := $(shell command -v qemu-system-i386 2>/dev/null || echo qemu-system-i386)
@@ -10,29 +11,38 @@ ISO     := $(BUILD)/muxos.iso
 ISO_DIR := $(BUILD)/isodir
 
 CPPFLAGS := -I. -Iarch/x86 -Iarch/x86/include \
-            -Ikernel -Ikernel/lib -Ikernel/mm -Ikernel/task \
+            -Ikernel -Ikernel/lib -Ikernel/mm -Ikernel/task -Ikernel/fs -Ikernel/tty \
             -Idrivers/input -Idrivers/platform -Idrivers/serial -Idrivers/video \
-            -Iuser/bin -Iuser/lib
+            -Idrivers/bus -Idrivers/virtio
 CFLAGS   := -m32 -ffreestanding -fno-builtin -fno-pic -O0 -g \
             -Wall -Wextra -MMD -MP
 LDFLAGS  := -m32 -T linker.ld -ffreestanding -nostdlib
 QEMUFLAGS ?= -display cocoa,zoom-to-fit=on
+# Host directory shared with the guest as /root (virtio-9p).
+VIRTFS ?= -virtfs local,path=$(CURDIR),mount_tag=host0,security_model=none
 
-# userlib.c currently includes user/bin/shell.c directly, so shell.c must not
-# be compiled separately. minishell is not linked into the kernel image yet.
+# The initial user process (and every other program) is a static ELF linked
+# against mlibc, built outside the kernel tree.  Each is embedded in the kernel
+# image with .incbin, copied into /bin at boot, and loaded from the filesystem.
 KERNEL_C_SRCS   := $(shell find arch kernel drivers -type f -name '*.c' | sort)
 KERNEL_ASM_SRCS := $(shell find arch -type f -name '*.s' | sort)
-USER_C_SRCS     := user/lib/userlib.c
-USER_ASM_SRCS   := user/crt/user_crt.s
 
-C_SRCS   := $(KERNEL_C_SRCS) $(USER_C_SRCS)
-ASM_SRCS := $(KERNEL_ASM_SRCS) $(USER_ASM_SRCS)
-OBJS     := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
-            $(patsubst %.s,$(BUILD)/%.o,$(ASM_SRCS))
-DEPS     := $(OBJS:.o=.d)
+KERNEL_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(KERNEL_C_SRCS)) \
+               $(patsubst %.s,$(BUILD)/%.o,$(KERNEL_ASM_SRCS))
+
+# Programs copied into /bin at boot: a space separated list of name=path
+# pairs.  Each is embedded in the kernel image with .incbin and exposed via
+# the table in kernel/fs/programs.h.
+PROGRAMS     ?=
+# Applet names hardlinked to the single multicall "toybox" program in /bin.
+APPLETS      ?=
+GEN_PROGRAMS := $(BUILD)/programs.S
+KERNEL_OBJS  += $(BUILD)/programs.o
+
+DEPS := $(KERNEL_OBJS:.o=.d)
 
 .DEFAULT_GOAL := all
-.PHONY: all run clean print-sources
+.PHONY: all run clean print-sources compile-commands
 
 all: $(ISO)
 
@@ -47,9 +57,43 @@ $(BUILD)/%.o: %.s
 # Interrupt code cannot rely on SSE register state.
 $(BUILD)/drivers/input/keyboard.o: CFLAGS += -mgeneral-regs-only
 
-$(KERNEL): $(OBJS) linker.ld
+# Always regenerate: PROGRAMS is not a file dependency make can track.
+$(GEN_PROGRAMS): FORCE
 	@mkdir -p $(@D)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS) -lgcc
+	@{ \
+	  printf '.section .rodata\n.align 4\n'; \
+	  printf '.global embedded_program_count\nembedded_program_count:\n.long %d\n' $(words $(PROGRAMS)); \
+	  printf '.global embedded_programs\nembedded_programs:\n'; \
+	  i=0; for p in $(PROGRAMS); do \
+	    printf '.long .Lpname%d\n.long .Lpstart%d\n.long .Lpend%d\n' $$i $$i $$i; \
+	    i=$$((i+1)); \
+	  done; \
+	  i=0; for p in $(PROGRAMS); do \
+	    n=$${p%%=*}; f=$${p#*=}; \
+	    printf '.Lpname%d:\n.asciz "%s"\n' $$i "$$n"; \
+	    printf '.Lpstart%d:\n.incbin "%s"\n.Lpend%d:\n' $$i "$$f" $$i; \
+	    i=$$((i+1)); \
+	  done; \
+	  printf '.global embedded_applet_count\nembedded_applet_count:\n.long %d\n' $(words $(APPLETS)); \
+	  printf '.global embedded_applets\nembedded_applets:\n'; \
+	  i=0; for a in $(APPLETS); do \
+	    printf '.long .Lapp%d\n' $$i; i=$$((i+1)); \
+	  done; \
+	  i=0; for a in $(APPLETS); do \
+	    printf '.Lapp%d:\n.asciz "%s"\n' $$i "$$a"; i=$$((i+1)); \
+	  done; \
+	} > $@
+
+$(BUILD)/programs.o: $(GEN_PROGRAMS)
+	@mkdir -p $(@D)
+	$(CC) -m32 -c $< -o $@
+
+.PHONY: FORCE
+FORCE:
+
+$(KERNEL): $(KERNEL_OBJS) linker.ld
+	@mkdir -p $(@D)
+	$(CC) $(LDFLAGS) -o $@ $(KERNEL_OBJS) -lgcc
 
 $(ISO): $(KERNEL)
 	@mkdir -p $(ISO_DIR)/boot/grub
@@ -64,12 +108,29 @@ $(ISO): $(KERNEL)
 	$(GRUB_MKRESCUE) -o $@ $(ISO_DIR)
 
 run: $(ISO)
-	$(QEMU) $(QEMUFLAGS) -cdrom $(ISO)
+	$(QEMU) $(QEMUFLAGS) $(VIRTFS) -cdrom $(ISO)
 
 clean:
 	rm -rf $(BUILD)
 
 print-sources:
-	@printf '%s\n' $(C_SRCS) $(ASM_SRCS)
+	@printf '%s\n' $(KERNEL_C_SRCS) $(KERNEL_ASM_SRCS)
+
+# clangd needs an absolute working directory so relative include paths keep
+# working after the source tree is moved. Regenerate with `make compile-commands`.
+compile-commands:
+	@tmp=compile_commands.json.tmp; \
+	printf '[\n' > $$tmp; \
+	first=1; \
+	for src in $(KERNEL_C_SRCS); do \
+	  if [ $$first -eq 0 ]; then printf ',\n' >> $$tmp; fi; \
+	  first=0; \
+	  extra=''; \
+	  if [ "$$src" = drivers/input/keyboard.c ]; then extra=' -mgeneral-regs-only'; fi; \
+	  printf '  {"directory":"%s","command":"i686-elf-gcc %s %s%s -c %s","file":"%s"}' \
+	    "$(CURDIR)" "$(CPPFLAGS)" "$(CFLAGS)" "$$extra" "$$src" "$$src" >> $$tmp; \
+	done; \
+	printf '\n]\n' >> $$tmp; \
+	mv $$tmp compile_commands.json
 
 -include $(DEPS)

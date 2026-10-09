@@ -1,5 +1,10 @@
 // kernel.c
 #include "kernel.h"
+#include "9p.h"
+#include "cpuid.h"
+#include "framebuffer.h"
+#include "fs.h"
+#include "fs/procfs.h"
 #include "gdt.h"
 #include "idt.h"
 #include "io.h"
@@ -7,6 +12,8 @@
 #include "pic.h"
 #include "pmm.h"
 #include "process.h"
+#include "serial.h"
+#include "terminal.h"
 #include "tss.h"
 #include "vga.h"
 #include "vmm.h"
@@ -30,11 +37,23 @@ int kernel_main(uint32_t magic, multiboot_info_t *mbi) {
   gdt_init();
   tss_init();
   pic_init();
-  pit_init(1000);
+  pit_init(PIT_HZ);
   idt_init();
+  serial_init();
+  if (CHECK_FLAG(mbi->flags, MULTIBOOT_INFO_FRAMEBUFFER) &&
+      mbi->framebuffer_addr <= 0xFFFFFFFFu && mbi->framebuffer_type == 1)
+    framebuffer_init((uint32_t)mbi->framebuffer_addr, mbi->framebuffer_width,
+                     mbi->framebuffer_height, mbi->framebuffer_pitch,
+                     mbi->framebuffer_bpp);
+  terminal_init();
   pmm_init(mbi);
   vmm_init();
   keyboard_init();
+  fs_init();
+  fs_selftest();
+  fs_procfs_init();
+  if (v9p_init())
+    v9p_mount("/root");
   process_register_current();
   process_create_kernel(task_kernel_init);
 
@@ -54,8 +73,10 @@ void panic(const char *msg) {
 
 void task_kernel_init() {
   print("kernel task init!\n", 0x0B);
-  process_create_user(0);
-  start_user_process(2, "shell");
+  clear_screen();
+  int pid = process_create_user();
+  if (pid > 0)
+    start_user_process(pid, "sh");
   while (1)
     ;
 }
